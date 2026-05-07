@@ -31,6 +31,12 @@ up in the command palette (e.g. `scoped-yolo: …`), so install it as `scoped-yo
 Symlink the entry point (recommended — picks up local edits automatically):
 
 ```sh
+mise run install
+```
+
+That runs:
+
+```sh
 mkdir -p ~/.config/amp/plugins
 ln -sf "$PWD/src/index.ts" ~/.config/amp/plugins/scoped-yolo.ts
 ```
@@ -76,9 +82,11 @@ Available in Amp's command palette under the `scoped-yolo:` category:
 ```sh
 mise install        # installs Bun
 bun install
-bun test            # 32 tests: rm parser/rewriter + end-to-end plugin behaviour
-bun run typecheck
+mise run test       # 32 tests: rm parser/rewriter + end-to-end plugin behaviour
+mise run typecheck
 ```
+
+`mise tasks` lists everything available (`install`, `test`, `typecheck`).
 
 ## What's not handled
 

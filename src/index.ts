@@ -10,19 +10,23 @@
  */
 
 import type { PluginAPI, ToolCallResult } from '@ampcode/plugin'
+import { lstat, realpath } from 'node:fs/promises'
 import * as path from 'node:path'
 
-export default function (amp: PluginAPI) {
+export default function scopedYolo(amp: PluginAPI) {
 	// Per-thread set of folders the user has approved for outside-workspace deletes.
 	const approvedFolders = new Map<string, Set<string>>()
 
 	let workspaceRootPromise: Promise<string> | null = null
 	const getWorkspaceRoot = (): Promise<string> => {
 		if (!workspaceRootPromise) {
-			workspaceRootPromise = (async () => {
-				const result = await amp.$`pwd`
-				return result.stdout.toString().trim()
-			})()
+			workspaceRootPromise = amp.$`pwd`
+				.then((result) => result.stdout.toString().trim())
+				.catch((err) => {
+					// Don't cache a failed lookup forever — let the next call retry.
+					workspaceRootPromise = null
+					throw err
+				})
 		}
 		return workspaceRootPromise
 	}
@@ -46,6 +50,7 @@ export default function (amp: PluginAPI) {
 		if (!parsed.hasDelete) return { action: 'allow' }
 
 		const root = await getWorkspaceRoot()
+		const canonicalRoot = await canonicalize(root)
 		const cmdCwd = shell.dir
 			? path.isAbsolute(shell.dir)
 				? shell.dir
@@ -53,17 +58,18 @@ export default function (amp: PluginAPI) {
 			: root
 
 		// Determine which folders, outside the workspace, would be affected.
-		const outsideFolders = new Set<string>()
+		const approvalScopes = new Set<string>()
 		for (const p of parsed.paths) {
 			const abs = path.isAbsolute(p) ? path.normalize(p) : path.resolve(cmdCwd, p)
-			if (!isInsideWorkspace(abs, root)) {
-				outsideFolders.add(path.dirname(abs))
+			const canonicalAbs = await canonicalize(abs)
+			if (!isStrictlyInsideWorkspace(canonicalAbs, canonicalRoot)) {
+				approvalScopes.add(await getApprovalScope(canonicalAbs))
 			}
 		}
 
-		if (outsideFolders.size > 0) {
+		if (approvalScopes.size > 0) {
 			const approved = approvedFolders.get(event.thread.id) ?? new Set<string>()
-			for (const folder of outsideFolders) {
+			for (const folder of approvalScopes) {
 				if (isAlreadyApproved(folder, approved)) continue
 
 				let confirmed: boolean
@@ -164,13 +170,42 @@ export default function (amp: PluginAPI) {
 
 // ---------- helpers ----------
 
-const SEPARATORS = new Set(['&&', '||', ';', '|', '&'])
+const SEPARATORS = new Set(['&&', '||', ';', '|', '&', '\n'])
 
-function isInsideWorkspace(absPath: string, root: string): boolean {
+/**
+ * Returns true only when `absPath` is a path strictly under `root`. The
+ * workspace root itself is intentionally treated as outside, so e.g.
+ * `rm -rf .` from the workspace requires explicit approval.
+ */
+function isStrictlyInsideWorkspace(absPath: string, root: string): boolean {
 	const normRoot = path.normalize(root)
 	const rel = path.relative(normRoot, absPath)
-	if (rel === '' || rel === '.') return false // the workspace itself counts as outside
+	if (rel === '' || rel === '.') return false
 	return !rel.startsWith('..') && !path.isAbsolute(rel)
+}
+
+async function canonicalize(abs: string): Promise<string> {
+	try {
+		return await realpath(abs)
+	} catch {
+		// Path doesn't exist (e.g. glob, already-deleted, typo) — fall back.
+		return abs
+	}
+}
+
+/**
+ * Approval scope for an outside-workspace target. Approving the directory
+ * itself when the target is a directory avoids the surprising case where
+ * deleting `/tmp` would otherwise approve `/`.
+ */
+async function getApprovalScope(abs: string): Promise<string> {
+	try {
+		const stat = await lstat(abs)
+		if (stat.isDirectory()) return abs
+	} catch {
+		// fall through
+	}
+	return path.dirname(abs)
 }
 
 function isAlreadyApproved(folder: string, approved: Set<string>): boolean {
