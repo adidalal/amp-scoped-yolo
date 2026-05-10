@@ -3,12 +3,14 @@
 A minimal permissions plugin for [Amp](https://ampcode.com) that makes deletes safer
 without getting in your way:
 
-1. **`rm` becomes `trash`.** Every `rm` / `rmdir` the agent runs is rewritten to
-   [`trash`](https://hasseg.org/trash/), so deletions are reversible — fish files back
-   out of the system trash if needed.
+1. **Deletions become `trash`.** Every `rm` / `rmdir` / `unlink` (and `find -delete`,
+   `find -exec rm`, `xargs rm`, …) the agent runs is rewritten to call `trash`, so
+   deletions are reversible — fish files back out of the system trash if needed.
 2. **Ask before deleting outside the workspace.** When a delete targets a path outside
    the workspace, you get one prompt per *folder* per thread. Approve once and any
-   subsequent deletes inside that folder (or its subfolders) proceed silently.
+   subsequent deletes inside that folder (or its subfolders) proceed silently. The
+   same prompt fires for `apply_patch` calls that would delete files outside the
+   workspace.
 
 In-workspace deletes are never prompted — they are just transparently rewritten to
 `trash`.
@@ -16,11 +18,11 @@ In-workspace deletes are never prompted — they are just transparently rewritte
 ## Requirements
 
 - [Amp](https://ampcode.com) (the plugin runs under Amp's bundled Bun runtime).
-- [`trash`](https://hasseg.org/trash/) on your `PATH`. On macOS:
+- A `trash` command on your `PATH`. Pick one:
 
-  ```sh
-  brew install trash
-  ```
+  - **macOS 14 Sonoma and later** ships a built-in [`/usr/bin/trash`](https://apple.stackexchange.com/a/476506/17907) — nothing to install.
+  - **Older macOS:** `brew install trash` (Ali Rantakari's [`trash`](https://hasseg.org/trash/)).
+  - **Linux:** `trash-cli` (`apt install trash-cli`, `brew install trash-cli`, etc.).
 
 ## Install
 
@@ -56,13 +58,31 @@ scoped-yolo loaded — rm→trash + ask-before-outside-delete
 
 ## Behaviour
 
-| Command the agent runs                   | What happens                                                                |
-| ---------------------------------------- | --------------------------------------------------------------------------- |
-| `rm -rf node_modules` (inside workspace) | Rewritten to `trash node_modules`, no prompt                                |
-| `rm -rf /tmp/foo`                        | Prompt: *Allow deletes anywhere inside `/tmp` for the rest of this thread?* |
-| `rm -rf /tmp/bar` (after approval above) | Rewritten to `trash /tmp/bar`, no prompt                                    |
-| `rm -rf /var/log/x` (different folder)   | New prompt for `/var/log`                                                   |
-| `mkdir tmp && rm -rf old && echo done`   | Rewritten to `mkdir tmp && trash old && echo done`                          |
+### Shell deletions
+
+| Command the agent runs                            | What happens                                                                |
+| ------------------------------------------------- | --------------------------------------------------------------------------- |
+| `rm -rf node_modules` (inside workspace)          | Rewritten to `trash node_modules`, no prompt                                |
+| `rmdir build`                                     | Rewritten to `trash build`                                                  |
+| `unlink foo.txt`                                  | Rewritten to `trash foo.txt`                                                |
+| `find /tmp/old -name "*.log" -delete`             | Rewritten to `find /tmp/old -name "*.log" -exec trash {} +`                 |
+| `find . -type f -exec rm -f {} +`                 | Rewritten to `find . -type f -exec trash {} +`                              |
+| `find . -name "*.tmp" -print0 \| xargs -0 rm -f`  | Rewritten to `find . -name "*.tmp" -print0 \| xargs -0 trash`               |
+| `rm -rf /tmp/foo`                                 | Prompt: *Allow deletes anywhere inside `/tmp` for the rest of this thread?* |
+| `rm -rf /tmp/bar` (after approval above)          | Rewritten to `trash /tmp/bar`, no prompt                                    |
+| `rm -rf /var/log/x` (different folder)            | New prompt for `/var/log`                                                   |
+| `mkdir tmp && rm -rf old && echo done`            | Rewritten to `mkdir tmp && trash old && echo done`                          |
+
+### File-tool deletions
+
+`apply_patch` calls that contain `*** Delete File: <path>` markers are intercepted too:
+
+- Inside-workspace deletes are allowed and logged so the deletion is visible.
+- Outside-workspace deletes go through the same per-folder prompt as shell deletes.
+- The patch itself isn't rewritten, so these deletions aren't reversible via `trash` —
+  the prompt is your only line of defence.
+
+### Denial / headless
 
 If the user denies a folder, the tool call is rejected with a clear message and the
 agent can pick another approach.
@@ -82,7 +102,7 @@ Available in Amp's command palette under the `scoped-yolo:` category:
 ```sh
 mise install        # installs Bun
 bun install
-mise run test       # 32 tests: rm parser/rewriter + end-to-end plugin behaviour
+mise run test       # 60 tests: parser/rewriter + apply_patch detection + end-to-end plugin behaviour
 mise run typecheck
 ```
 
@@ -90,8 +110,13 @@ mise run typecheck
 
 ## What's not handled
 
-- Other deletion paths (`find -delete`, `unlink`, custom delete scripts) are not
-  detected. The plugin only intercepts `rm` and `rmdir`. Add cases to `parseDeletes` /
-  `rewriteRmToTrash` in [`src/index.ts`](src/index.ts) if you want more.
-- File-tool deletes (e.g. `apply_patch` removing a file) are not prompted — they don't
-  go through `rm`.
+- Custom delete scripts (a wrapper script, a project-specific `bin/clean`, a plugin
+  tool with its own deletion verb, …) aren't recognised. The plugin only knows about
+  the deletion patterns listed above. Add cases to `parseDeletes` /
+  `rewriteRmToTrash` / `parseFileToolDeletes` in [`src/index.ts`](src/index.ts) if
+  you want more.
+- `apply_patch` deletions are detected and prompted on, but not rewritten — once
+  approved, the file is gone for real. Use git or backups if you need recovery.
+- `xargs rm` is rewritten to `xargs trash`, but its delete targets come from stdin
+  and can't be statically inspected, so they don't contribute to the
+  outside-workspace approval check.

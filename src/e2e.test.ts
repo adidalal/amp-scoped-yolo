@@ -68,6 +68,18 @@ function makeAmp(opts: { confirmAnswers?: boolean[] } = {}) {
 		).then((res: any) => ({ result: res, toolUseID }))
 	}
 
+	const fireRawToolCall = (
+		tool: string,
+		input: Record<string, unknown>,
+		threadId = 'thread-1',
+	) => {
+		const toolUseID = `toolu_${nextToolUseID++}`
+		return handlers['tool.call']!(
+			{ toolUseID, tool, input, thread: { id: threadId } },
+			ctx,
+		).then((res: any) => ({ result: res, toolUseID }))
+	}
+
 	const fireToolResult = (
 		toolUseID: string,
 		status: 'done' | 'error',
@@ -86,6 +98,7 @@ function makeAmp(opts: { confirmAnswers?: boolean[] } = {}) {
 
 	return {
 		fireToolCall,
+		fireRawToolCall,
 		fireToolResult,
 		confirmCalls,
 		notifyCalls,
@@ -220,5 +233,59 @@ describe('scoped-yolo e2e', () => {
 		await amp.fireToolResult('toolu_unrelated', 'error', { error: 'whatever' })
 		const matched = amp.logs.find((l) => l.includes("If 'trash' is not installed"))
 		expect(matched).toBeFalsy()
+	})
+
+	it('allows non-shell tool calls without deletes', async () => {
+		const { result } = await amp.fireRawToolCall('apply_patch', {
+			input: '*** Begin Patch\n*** Update File: foo.ts\n@@\n-x\n+y\n*** End Patch\n',
+		})
+		expect(result).toEqual({ action: 'allow' })
+		expect(amp.confirmCalls.length).toBe(0)
+	})
+
+	it('logs and allows in-workspace apply_patch deletes without prompting', async () => {
+		const { result } = await amp.fireRawToolCall('apply_patch', {
+			input: '*** Begin Patch\n*** Delete File: src/old.ts\n*** End Patch\n',
+		})
+		expect(result).toEqual({ action: 'allow' })
+		expect(amp.confirmCalls.length).toBe(0)
+		const logged = amp.logs.find(
+			(l) => l.includes('apply_patch will delete') && l.includes('src/old.ts'),
+		)
+		expect(logged).toBeTruthy()
+	})
+
+	it('prompts when apply_patch deletes a file outside the workspace', async () => {
+		const a = makeAmp({ confirmAnswers: [true] })
+		const { result } = await a.fireRawToolCall('apply_patch', {
+			input: '*** Begin Patch\n*** Delete File: /tmp/danger.txt\n*** End Patch\n',
+		})
+		expect(a.confirmCalls.length).toBe(1)
+		expect(a.confirmCalls[0]!.message).toContain('/tmp')
+		expect(result).toEqual({ action: 'allow' })
+	})
+
+	it('rejects when user denies an outside-workspace apply_patch delete', async () => {
+		const a = makeAmp({ confirmAnswers: [false] })
+		const { result } = await a.fireRawToolCall('apply_patch', {
+			input: '*** Begin Patch\n*** Delete File: /tmp/danger.txt\n*** End Patch\n',
+		})
+		expect(result.action).toBe('reject-and-continue')
+		expect(result.message).toContain('/tmp')
+	})
+
+	it('detects multiple Delete File markers in one apply_patch call', async () => {
+		const { result } = await amp.fireRawToolCall('apply_patch', {
+			input:
+				'*** Begin Patch\n' +
+				'*** Delete File: a.txt\n' +
+				'*** Delete File: b/c.txt\n' +
+				'*** End Patch\n',
+		})
+		expect(result).toEqual({ action: 'allow' })
+		const logged = amp.logs.find(
+			(l) => l.includes('a.txt') && l.includes('b/c.txt') && l.includes('2 file(s)'),
+		)
+		expect(logged).toBeTruthy()
 	})
 })
