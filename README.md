@@ -25,7 +25,8 @@ without getting in your way:
 
 ## Requirements
 
-- [Amp](https://ampcode.com) (the plugin runs under Amp's bundled Bun runtime).
+- [Amp Neo](https://ampcode.com/news/neo) — plugins require the Neo runtime
+  (the plugin itself runs under Amp's bundled Bun runtime).
 - A `trash` command on your `PATH`. Pick one:
 
   - **macOS 14 Sonoma and later** ships a built-in [`/usr/bin/trash`](https://apple.stackexchange.com/a/476506/17907) — nothing to install.
@@ -110,7 +111,7 @@ Available in Amp's command palette under the `scoped-yolo:` category:
 ```sh
 mise install        # installs Bun
 bun install
-mise run test       # 60 tests: parser/rewriter + apply_patch detection + end-to-end plugin behaviour
+mise run test       # 66 tests: parser/rewriter + apply_patch detection + end-to-end plugin behaviour
 mise run typecheck
 ```
 
