@@ -12,8 +12,16 @@ without getting in your way:
    same prompt fires for `apply_patch` calls that would delete files outside the
    workspace.
 
-In-workspace deletes are never prompted — they are just transparently rewritten to
-`trash`.
+## Mental model
+
+- **Strictly inside the workspace?** Silently rewrite the delete to `trash` (reversible).
+- **Outside the workspace?** Prompt once per folder per thread; on approval, rewrite to
+  `trash` and remember the folder.
+- **The workspace root itself** (e.g. `rm -rf .` from the workspace root) is treated as
+  outside, so it still prompts.
+- **Approval scope is by folder, not by individual target.** Deleting `/tmp/foo.txt`
+  asks you to approve `/tmp` (the parent dir); deleting the directory `/tmp/build/`
+  asks you to approve `/tmp/build` itself.
 
 ## Requirements
 
@@ -110,6 +118,9 @@ mise run typecheck
 
 ## What's not handled
 
+- The shell parser is a small, test-driven tokenizer for common delete forms
+  (`rm`/`rmdir`/`unlink`, `find -delete` / `-exec rm`, `xargs rm`). It is **not** a
+  full POSIX shell parser; exotic constructs may slip past detection.
 - Custom delete scripts (a wrapper script, a project-specific `bin/clean`, a plugin
   tool with its own deletion verb, …) aren't recognised. The plugin only knows about
   the deletion patterns listed above. Add cases to `parseDeletes` /

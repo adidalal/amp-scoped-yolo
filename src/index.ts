@@ -1,85 +1,242 @@
 // @i-know-the-amp-plugin-api-is-wip-and-very-experimental-right-now
 /**
- * scoped-yolo — minimal permissions plugin for Amp.
- *
- * Policies:
- *   1. Always rewrite `rm` / `rmdir` to `trash` so deletions are reversible.
- *   2. If a deletion targets a path outside the workspace, ask the user once
- *      per folder (per thread). Subsequent deletions inside an approved folder
- *      proceed silently.
+ * scoped-yolo
+ *  - Rewrite shell deletes (rm/rmdir/unlink, find -delete, xargs rm) to `trash`.
+ *  - Ask once per outside-workspace folder per thread before any delete that
+ *    targets a path outside the workspace.
  */
 
 import type { PluginAPI, ToolCallResult } from '@ampcode/plugin'
 import { lstat, realpath } from 'node:fs/promises'
 import * as path from 'node:path'
 
-export default function scopedYolo(amp: PluginAPI) {
-	// Per-thread set of folders the user has approved for outside-workspace deletes.
-	const approvedFolders = new Map<string, Set<string>>()
+// ---------- types & module constants ----------
 
-	let workspaceRootPromise: Promise<string> | null = null
-	const getWorkspaceRoot = (): Promise<string> => {
-		if (!workspaceRootPromise) {
-			workspaceRootPromise = amp.$`pwd`
-				.then((result) => result.stdout.toString().trim())
-				.catch((err) => {
-					// Don't cache a failed lookup forever — let the next call retry.
-					workspaceRootPromise = null
-					throw err
-				})
-		}
-		return workspaceRootPromise
+interface WorkspaceInfo {
+	root: string
+	canonicalRoot: string
+}
+
+interface ConfirmOptions {
+	title: string
+	message: string
+	confirmButtonText?: string
+}
+
+interface ToolCallContext {
+	logger: { log(message: string): void }
+	ui: {
+		confirm(options: ConfirmOptions): Promise<boolean>
+		notify(message: string): Promise<void>
 	}
+}
 
-	// Rewritten commands we want to follow up on in tool.result, so we can give
-	// the user a clearer message if `trash` is missing or fails for some reason.
-	const rewrittenCalls = new Map<string, { original: string; rewritten: string }>()
+const RM_LIKE = new Set(['rm', 'rmdir', 'unlink'])
+
+const APPLY_PATCH_TOOL_NAMES = new Set(['apply_patch', 'apply-patch', 'applypatch'])
+
+/** xargs flags that consume a following argument. */
+const XARGS_FLAGS_WITH_ARG = new Set([
+	'-I',
+	'-i',
+	'-L',
+	'-l',
+	'-n',
+	'-P',
+	'-s',
+	'-E',
+	'-d',
+	'-a',
+	'--replace',
+	'--max-lines',
+	'--max-args',
+	'--max-procs',
+	'--max-chars',
+	'--eof',
+	'--delimiter',
+	'--arg-file',
+])
+
+const SEPARATORS = new Set(['&&', '||', ';', '|', '&', '\n'])
+
+// ---------- plugin entry ----------
+
+export default function scopedYolo(amp: PluginAPI) {
+	// Folders the user has approved for outside-workspace deletes, keyed by
+	// thread id. Stored absolute, normalized, and canonical (symlink-resolved)
+	// when possible.
+	const approvedOutsideFoldersByThread = new Map<string, Set<string>>()
+
+	// Bash calls we rewrote and want to follow up on in tool.result, so we can
+	// give a clearer message if `trash` is missing or fails.
+	const pendingRewrittenCalls = new Map<
+		string,
+		{ original: string; rewritten: string }
+	>()
+
+	// Workspace root + its canonical form. Cached for the life of the plugin
+	// instance — we assume one plugin instance per workspace/session. Resolved
+	// lazily, only when a delete is detected, so a `pwd` failure can't affect
+	// unrelated tool calls.
+	let workspaceInfoPromise: Promise<WorkspaceInfo> | null = null
+	const getWorkspaceInfo = (): Promise<WorkspaceInfo> => {
+		if (!workspaceInfoPromise) {
+			workspaceInfoPromise = (async () => {
+				const result = await amp.$`pwd`
+				const root = result.stdout.toString().trim()
+				const canonicalRoot = await canonicalize(root)
+				return { root, canonicalRoot }
+			})().catch((err) => {
+				// Don't cache a failed lookup forever — let the next call retry.
+				workspaceInfoPromise = null
+				throw err
+			})
+		}
+		return workspaceInfoPromise
+	}
 
 	amp.on('session.start', () => {
 		amp.logger.log('scoped-yolo loaded — rm→trash + ask-before-outside-delete')
 	})
 
+	amp.on('tool.call', async (event, ctx): Promise<ToolCallResult> => {
+		// Use the helpers API to recognize any shell-command tool call (Bash,
+		// shell_command, …) instead of branching on a hard-coded tool name.
+		const shell = amp.helpers.shellCommandFromToolCall(event)
+		if (shell) return handleShellToolCall(event, ctx, shell)
+		return handleFileToolCall(event, ctx)
+	})
+
+	async function handleShellToolCall(
+		event: any,
+		ctx: ToolCallContext,
+		shell: { command: string; dir?: string },
+	): Promise<ToolCallResult> {
+		const originalCmd = shell.command
+		const parsed = parseDeletes(originalCmd)
+		if (!parsed.hasDelete) return { action: 'allow' }
+
+		const workspace = await safeGetWorkspaceInfo(ctx)
+		if (!workspace) return blockedNoWorkspace()
+
+		const resolveFromDir = shell.dir
+			? path.isAbsolute(shell.dir)
+				? shell.dir
+				: path.resolve(workspace.root, shell.dir)
+			: workspace.root
+
+		const reject = await approveOutsideWorkspaceDeletes(event, ctx, parsed.paths, {
+			resolveFromDir,
+			workspace,
+		})
+		if (reject) return reject
+
+		// Inside-workspace deletes never prompt; outside-workspace deletes only
+		// reach here after approval above.
+		const rewritten = rewriteRmToTrash(originalCmd)
+		if (rewritten === originalCmd) return { action: 'allow' }
+
+		const newInput = replaceTopLevelStringValue(
+			event.input as Record<string, unknown>,
+			originalCmd,
+			rewritten,
+		)
+		if (!newInput) return { action: 'allow' }
+
+		pendingRewrittenCalls.set(event.toolUseID, { original: originalCmd, rewritten })
+		ctx.logger.log(`scoped-yolo rewrote: ${originalCmd}  →  ${rewritten}`)
+		return { action: 'modify', input: newInput }
+	}
+
+	async function handleFileToolCall(
+		event: any,
+		ctx: ToolCallContext,
+	): Promise<ToolCallResult> {
+		// Non-shell tool calls: detect file-tool deletes (e.g. apply_patch
+		// removing a file). We can't rewrite these to `trash`, but we can apply
+		// the same outside-workspace approval check and log the deletion.
+		const fileDeletes = parseFileToolDeletes(event.tool, event.input)
+		if (fileDeletes.length === 0) return { action: 'allow' }
+
+		const workspace = await safeGetWorkspaceInfo(ctx)
+		if (!workspace) return blockedNoWorkspace()
+
+		const reject = await approveOutsideWorkspaceDeletes(event, ctx, fileDeletes, {
+			resolveFromDir: workspace.root,
+			workspace,
+		})
+		if (reject) return reject
+
+		ctx.logger.log(
+			`scoped-yolo: ${event.tool} will delete ${fileDeletes.length} file(s): ` +
+				`${fileDeletes.join(', ')} (file-tool deletes are not reversible via 'trash')`,
+		)
+		return { action: 'allow' }
+	}
+
+	async function safeGetWorkspaceInfo(
+		ctx: ToolCallContext,
+	): Promise<WorkspaceInfo | undefined> {
+		try {
+			return await getWorkspaceInfo()
+		} catch (err) {
+			ctx.logger.log(
+				`scoped-yolo: failed to determine workspace root, blocking delete. ` +
+					(err instanceof Error ? err.message : String(err)),
+			)
+			return undefined
+		}
+	}
+
 	/**
 	 * Ask the user once per outside-workspace folder before allowing a delete
 	 * that targets it. Returns a reject result, or undefined to proceed.
 	 */
-	const requireApprovalForOutsidePaths = async (
+	async function approveOutsideWorkspaceDeletes(
 		event: { thread: { id: string }; input: unknown },
-		ctx: { ui: { confirm: (o: any) => Promise<boolean> } },
-		paths: string[],
-		cmdCwd: string,
-		root: string,
-		canonicalRoot: string,
-	): Promise<ToolCallResult | undefined> => {
-		const approvalScopes = new Set<string>()
-		for (const p of paths) {
-			const abs = path.isAbsolute(p) ? path.normalize(p) : path.resolve(cmdCwd, p)
-			const canonicalAbs = await canonicalize(abs)
-			if (!isStrictlyInsideWorkspace(canonicalAbs, canonicalRoot)) {
-				approvalScopes.add(await getApprovalScope(canonicalAbs))
-			}
-		}
-		if (approvalScopes.size === 0) return undefined
+		ctx: ToolCallContext,
+		targets: string[],
+		opts: { resolveFromDir: string; workspace: WorkspaceInfo },
+	): Promise<ToolCallResult | undefined> {
+		const { resolveFromDir, workspace } = opts
 
-		const approved = approvedFolders.get(event.thread.id) ?? new Set<string>()
-		for (const folder of approvalScopes) {
-			if (isAlreadyApproved(folder, approved)) continue
+		// Group outside-workspace targets by the folder we'll ask approval for,
+		// so multiple targets under the same folder share a single prompt.
+		const targetsByFolder = new Map<string, string[]>()
+		for (const p of targets) {
+			const abs = path.isAbsolute(p) ? path.normalize(p) : path.resolve(resolveFromDir, p)
+			const canonicalAbs = await canonicalize(abs)
+			if (isStrictDescendantOfWorkspace(canonicalAbs, workspace.canonicalRoot)) continue
+			const folder = await getApprovedFolderForTarget(canonicalAbs)
+			const list = targetsByFolder.get(folder) ?? []
+			list.push(p)
+			targetsByFolder.set(folder, list)
+		}
+		if (targetsByFolder.size === 0) return undefined
+
+		const approved =
+			approvedOutsideFoldersByThread.get(event.thread.id) ?? new Set<string>()
+		for (const [folder, folderTargets] of targetsByFolder) {
+			if (isPathCoveredByApprovedFolder(folder, approved)) continue
 
 			let confirmed: boolean
 			try {
 				confirmed = await ctx.ui.confirm({
-					title: 'Delete outside workspace?',
+					title: 'Allow delete outside workspace?',
 					message:
-						`scoped-yolo: a delete is targeting \`${folder}\`, which is outside the workspace (${root}).\n\n` +
-						`Allow deletes anywhere inside \`${folder}\` for the rest of this thread?`,
-					confirmButtonText: 'Allow folder',
+						`The agent wants to delete:\n` +
+						folderTargets.map((p) => `• ${p}`).join('\n') +
+						`\n\nThis is outside the workspace (${workspace.root}).\n\n` +
+						`Allowing this will permit further deletes anywhere inside:\n${folder}\n` +
+						`for the rest of this thread.`,
+					confirmButtonText: `Allow ${folder}`,
 				})
 			} catch (err) {
 				if (err instanceof Error && amp.helpers.isPluginUINotAvailableError(err)) {
 					return {
 						action: 'reject-and-continue',
 						message:
-							`scoped-yolo blocked a delete in ${folder} (outside workspace ${root}). ` +
+							`Blocked delete outside workspace (${folder}). ` +
 							`No interactive UI is available to ask the user for approval.`,
 					}
 				}
@@ -89,94 +246,19 @@ export default function scopedYolo(amp: PluginAPI) {
 			if (!confirmed) {
 				return {
 					action: 'reject-and-continue',
-					message: `scoped-yolo: user denied deletion in ${folder} (outside workspace ${root}).`,
+					message: `Blocked delete outside workspace: user denied deletion in ${folder}.`,
 				}
 			}
 			approved.add(folder)
 		}
-		approvedFolders.set(event.thread.id, approved)
+		approvedOutsideFoldersByThread.set(event.thread.id, approved)
 		return undefined
 	}
 
-	amp.on('tool.call', async (event, ctx): Promise<ToolCallResult> => {
-		const root = await getWorkspaceRoot()
-		const canonicalRoot = await canonicalize(root)
-
-		// Use the helpers API to recognize any shell-command tool call (Bash,
-		// shell_command, etc.) instead of branching on a hard-coded tool name.
-		const shell = amp.helpers.shellCommandFromToolCall(event)
-		if (shell) {
-			const originalCmd = shell.command
-			const parsed = parseDeletes(originalCmd)
-			if (!parsed.hasDelete) return { action: 'allow' }
-
-			const cmdCwd = shell.dir
-				? path.isAbsolute(shell.dir)
-					? shell.dir
-					: path.resolve(root, shell.dir)
-				: root
-
-			const reject = await requireApprovalForOutsidePaths(
-				event,
-				ctx,
-				parsed.paths,
-				cmdCwd,
-				root,
-				canonicalRoot,
-			)
-			if (reject) return reject
-
-			// Rewrite rm/rmdir → trash. Inside-workspace deletes never prompt;
-			// outside-workspace deletes only get here after approval above.
-			const rewritten = rewriteRmToTrash(originalCmd)
-			if (rewritten === originalCmd) return { action: 'allow' }
-
-			// Find the input key whose value is the original command and replace
-			// it. This works for both Bash (`cmd`) and shell_command (`command`)
-			// without hard-coding either name.
-			const newInput: Record<string, unknown> = { ...(event.input as Record<string, unknown>) }
-			let replaced = false
-			for (const [k, v] of Object.entries(newInput)) {
-				if (typeof v === 'string' && v === originalCmd) {
-					newInput[k] = rewritten
-					replaced = true
-				}
-			}
-			if (!replaced) return { action: 'allow' }
-
-			rewrittenCalls.set(event.toolUseID, { original: originalCmd, rewritten })
-			ctx.logger.log(`scoped-yolo rewrote: ${originalCmd}  →  ${rewritten}`)
-			return { action: 'modify', input: newInput }
-		}
-
-		// Non-shell tool calls: detect file-tool deletes (e.g. apply_patch
-		// removing a file). We can't rewrite these to `trash`, but we can at
-		// least apply the same outside-workspace approval check and log the
-		// deletion so it's visible.
-		const fileDeletes = parseFileToolDeletes(event.tool, event.input)
-		if (fileDeletes.length === 0) return { action: 'allow' }
-
-		const reject = await requireApprovalForOutsidePaths(
-			event,
-			ctx,
-			fileDeletes,
-			root,
-			root,
-			canonicalRoot,
-		)
-		if (reject) return reject
-
-		ctx.logger.log(
-			`scoped-yolo: ${event.tool} will delete ${fileDeletes.length} file(s): ${fileDeletes.join(', ')}` +
-				` (file-tool deletes are not reversible via 'trash')`,
-		)
-		return { action: 'allow' }
-	})
-
 	amp.on('tool.result', (event) => {
-		const tracked = rewrittenCalls.get(event.toolUseID)
+		const tracked = pendingRewrittenCalls.get(event.toolUseID)
 		if (!tracked) return
-		rewrittenCalls.delete(event.toolUseID)
+		pendingRewrittenCalls.delete(event.toolUseID)
 		if (event.status !== 'error') return
 		amp.logger.log(
 			`scoped-yolo: rewritten command failed (${tracked.rewritten}). ` +
@@ -189,12 +271,12 @@ export default function scopedYolo(amp: PluginAPI) {
 	amp.registerCommand(
 		'show-approvals',
 		{
-			title: 'Show approved delete folders',
+			title: 'Show approved outside-workspace folders',
 			description: 'List folders this thread has approved for outside-workspace deletes.',
 		},
 		async (ctx) => {
 			const id = ctx.thread?.id
-			const approved = id ? approvedFolders.get(id) : undefined
+			const approved = id ? approvedOutsideFoldersByThread.get(id) : undefined
 			const list = approved && approved.size > 0 ? [...approved].sort().join('\n') : '(none)'
 			await ctx.ui.notify(`scoped-yolo approved folders for this thread:\n${list}`)
 		},
@@ -203,47 +285,60 @@ export default function scopedYolo(amp: PluginAPI) {
 	amp.registerCommand(
 		'clear-approvals',
 		{
-			title: 'Clear approved delete folders',
+			title: 'Clear approved outside-workspace folders',
 			description: 'Forget approved outside-workspace folders for this thread.',
 		},
 		async (ctx) => {
-			if (ctx.thread) approvedFolders.delete(ctx.thread.id)
+			if (ctx.thread) approvedOutsideFoldersByThread.delete(ctx.thread.id)
 			await ctx.ui.notify('scoped-yolo: cleared approved folders for this thread.')
 		},
 	)
 }
 
-// ---------- helpers ----------
+function blockedNoWorkspace(): ToolCallResult {
+	return {
+		action: 'reject-and-continue',
+		message:
+			'scoped-yolo blocked this delete because it could not determine the workspace root safely.',
+	}
+}
 
-const SEPARATORS = new Set(['&&', '||', ';', '|', '&', '\n'])
+// ---------- approval / path helpers ----------
 
 /**
- * Returns true only when `absPath` is a path strictly under `root`. The
- * workspace root itself is intentionally treated as outside, so e.g.
- * `rm -rf .` from the workspace requires explicit approval.
+ * True only when `absPath` is a path strictly *under* `root`. The workspace
+ * root itself is intentionally treated as outside, so e.g. `rm -rf .` from
+ * the workspace requires explicit approval.
  */
-function isStrictlyInsideWorkspace(absPath: string, root: string): boolean {
-	const normRoot = path.normalize(root)
-	const rel = path.relative(normRoot, absPath)
+function isStrictDescendantOfWorkspace(absPath: string, root: string): boolean {
+	const rel = path.relative(path.normalize(root), absPath)
 	if (rel === '' || rel === '.') return false
 	return !rel.startsWith('..') && !path.isAbsolute(rel)
+}
+
+/** True if `child` is the same as, or a descendant of, `parent`. */
+function isPathEqualOrDescendant(child: string, parent: string): boolean {
+	const rel = path.relative(parent, child)
+	return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
 }
 
 async function canonicalize(abs: string): Promise<string> {
 	try {
 		return await realpath(abs)
 	} catch {
-		// Path doesn't exist (e.g. glob, already-deleted, typo) — fall back.
+		// Path doesn't exist (glob, already-deleted, typo) — fall back.
 		return abs
 	}
 }
 
 /**
- * Approval scope for an outside-workspace target. Approving the directory
- * itself when the target is a directory avoids the surprising case where
- * deleting `/tmp` would otherwise approve `/`.
+ * The folder we ask the user to approve when `abs` is targeted by a delete.
+ *
+ * - If `abs` is a directory, approve `abs` itself. (Approving the parent of
+ *   `/tmp` would otherwise leak approval to `/`.)
+ * - If `abs` is a file (or unknown), approve its parent directory.
  */
-async function getApprovalScope(abs: string): Promise<string> {
+async function getApprovedFolderForTarget(abs: string): Promise<string> {
 	try {
 		const stat = await lstat(abs)
 		if (stat.isDirectory()) return abs
@@ -253,15 +348,39 @@ async function getApprovalScope(abs: string): Promise<string> {
 	return path.dirname(abs)
 }
 
-function isAlreadyApproved(folder: string, approved: Set<string>): boolean {
+function isPathCoveredByApprovedFolder(folder: string, approved: Set<string>): boolean {
 	const norm = path.normalize(folder)
 	for (const a of approved) {
-		const an = path.normalize(a)
-		if (norm === an) return true
-		if (norm.startsWith(an + path.sep)) return true
+		if (isPathEqualOrDescendant(norm, path.normalize(a))) return true
 	}
 	return false
 }
+
+/**
+ * Replace a top-level string field on a tool input. Only string-valued
+ * top-level fields whose value equals `from` are replaced; nested objects
+ * and arrays are not traversed. This is enough for current shell tools
+ * (Bash's `cmd`, shell_command's `command`).
+ *
+ * Returns the new input, or undefined if no field matched.
+ */
+function replaceTopLevelStringValue(
+	input: Record<string, unknown>,
+	from: string,
+	to: string,
+): Record<string, unknown> | undefined {
+	const out: Record<string, unknown> = { ...input }
+	let replaced = false
+	for (const [k, v] of Object.entries(out)) {
+		if (typeof v === 'string' && v === from) {
+			out[k] = to
+			replaced = true
+		}
+	}
+	return replaced ? out : undefined
+}
+
+// ---------- file-tool delete detection ----------
 
 /**
  * Detects deletions performed by non-shell tools (the LLM's file editor).
@@ -270,31 +389,21 @@ function isAlreadyApproved(folder: string, approved: Set<string>): boolean {
  * `*** Delete File: <path>` markers. Returns the list of paths the tool
  * would delete (empty if none).
  *
- * These are taken from the tool input verbatim — they may be relative to
- * the workspace root.
+ * Only top-level string fields of `input` are scanned — schema-agnostic but
+ * intentionally shallow. Paths come from the tool input verbatim and may be
+ * relative to the workspace root.
  */
-export function parseFileToolDeletes(
-	tool: string,
-	input: unknown,
-): string[] {
+export function parseFileToolDeletes(tool: string, input: unknown): string[] {
 	if (!input || typeof input !== 'object') return []
+	if (!isApplyPatchLikeTool(tool)) return []
 	const inputObj = input as Record<string, unknown>
-
-	// apply_patch and friends ship the patch text as one of these field names
-	// depending on the tool variant. Scan all string-valued fields so we don't
-	// have to know the exact schema.
-	const candidates: string[] = []
-	if (isApplyPatchToolName(tool)) {
-		for (const v of Object.values(inputObj)) {
-			if (typeof v === 'string') candidates.push(v)
-		}
-	}
 
 	const paths: string[] = []
 	const seen = new Set<string>()
 	const re = /^\s*\*\*\*\s*Delete File:\s*(.+?)\s*$/gm
-	for (const text of candidates) {
-		for (const m of text.matchAll(re)) {
+	for (const v of Object.values(inputObj)) {
+		if (typeof v !== 'string') continue
+		for (const m of v.matchAll(re)) {
 			const p = m[1]!.trim()
 			if (p && !seen.has(p)) {
 				seen.add(p)
@@ -305,28 +414,30 @@ export function parseFileToolDeletes(
 	return paths
 }
 
-function isApplyPatchToolName(tool: string): boolean {
-	// Cover the main variants: 'apply_patch', 'apply-patch', and the older
-	// 'str_replace_based_edit_tool' style is intentionally excluded since it
-	// doesn't support deletes via patch markers.
-	const t = tool.toLowerCase()
-	return t === 'apply_patch' || t === 'apply-patch' || t === 'applypatch'
+function isApplyPatchLikeTool(tool: string): boolean {
+	// The older `str_replace_based_edit_tool` style is intentionally excluded
+	// since it doesn't express deletes via patch markers.
+	return APPLY_PATCH_TOOL_NAMES.has(tool.toLowerCase())
 }
+
+// ---------- shell delete parsing / rewriting ----------
+//
+// scoped-yolo uses a small, test-driven tokenizer for common shell forms
+// (rm/rmdir/unlink, find -delete / -exec rm, xargs rm). It is not a full
+// POSIX shell parser.
 
 interface ParseResult {
 	hasDelete: boolean
-	/** All path arguments (literal, possibly globbed) targeted by deletion invocations. */
+	/** Path arguments (literal, possibly globbed) targeted by deletion invocations. */
 	paths: string[]
 }
-
-const RM_LIKE = new Set(['rm', 'rmdir', 'unlink'])
 
 /**
  * Walks the command, splits on shell separators, and, for each segment whose
  * first command word looks like a deletion (`rm`, `rmdir`, `unlink`, or
  * `find ... -delete` / `find ... -exec rm`), extracts its path arguments.
  *
- * `xargs rm` is detected as a delete (so it gets rewritten to trash), but
+ * `xargs rm` is detected as a delete (so it gets rewritten to `trash`), but
  * its paths come from stdin and can't be statically extracted, so it doesn't
  * contribute to approval scopes.
  */
@@ -335,31 +446,17 @@ export function parseDeletes(cmd: string): ParseResult {
 	for (const segment of splitOnSeparators(cmd)) {
 		const tokens = tokenize(segment)
 		if (tokens.length === 0) continue
-		// Skip leading env assignments like FOO=bar BAZ=qux rm ...
-		let i = 0
-		while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(stripQuotes(tokens[i]!))) i++
-		const head = i < tokens.length ? stripQuotes(tokens[i]!) : ''
+		const headIdx = skipEnvAssignments(tokens)
+		const head = headIdx < tokens.length ? stripQuotes(tokens[headIdx]!) : ''
 
 		if (RM_LIKE.has(head)) {
 			result.hasDelete = true
-			let sawDoubleDash = false
-			for (let j = i + 1; j < tokens.length; j++) {
-				const tok = tokens[j]!
-				const bare = stripQuotes(tok)
-				if (!sawDoubleDash) {
-					if (bare === '--') {
-						sawDoubleDash = true
-						continue
-					}
-					if (bare.startsWith('-') && bare.length > 1) continue // flag
-				}
-				result.paths.push(bare)
-			}
+			result.paths.push(...collectRmPathTokens(tokens, headIdx))
 			continue
 		}
 
 		if (head === 'find') {
-			const findInfo = analyzeFind(tokens, i)
+			const findInfo = analyzeFind(tokens, headIdx)
 			if (findInfo.isDelete) {
 				result.hasDelete = true
 				result.paths.push(...findInfo.paths)
@@ -368,17 +465,33 @@ export function parseDeletes(cmd: string): ParseResult {
 		}
 
 		if (head === 'xargs') {
-			// `xargs [opts] rm/rmdir/unlink ...` — paths are read from stdin
-			// so we can't extract them, but we still want to mark this as a
-			// delete so rewriteRmToTrash gets a chance to swap in `trash`.
-			const sub = findXargsCommand(tokens, i)
-			if (sub && RM_LIKE.has(sub)) {
-				result.hasDelete = true
-			}
+			// `xargs [opts] rm/rmdir/unlink ...` — paths come from stdin so we
+			// can't extract them, but we still want to rewrite to `trash`.
+			const sub = findXargsCommand(tokens, headIdx)
+			if (sub && RM_LIKE.has(sub)) result.hasDelete = true
 			continue
 		}
 	}
 	return result
+}
+
+/** Collect the (non-flag) path tokens of an `rm`/`rmdir`/`unlink` invocation. */
+function collectRmPathTokens(tokens: string[], headIdx: number): string[] {
+	const paths: string[] = []
+	let sawDoubleDash = false
+	for (let j = headIdx + 1; j < tokens.length; j++) {
+		const tok = tokens[j]!
+		const bare = stripQuotes(tok)
+		if (!sawDoubleDash) {
+			if (bare === '--') {
+				sawDoubleDash = true
+				continue
+			}
+			if (bare.startsWith('-') && bare.length > 1) continue
+		}
+		paths.push(bare)
+	}
+	return paths
 }
 
 interface FindAnalysis {
@@ -398,12 +511,9 @@ function analyzeFind(tokens: string[], headIdx: number): FindAnalysis {
 	for (let j = headIdx + 1; j < tokens.length; j++) {
 		const bare = stripQuotes(tokens[j]!)
 
-		// find's expression starts at the first token that begins with `-`,
-		// `(`, `)`, `!`, or `,`. Before that we may see global options like
-		// `-H`, `-L`, `-P`, `-D debug`, `-O level`, but those also start with
-		// `-`. To keep things simple, treat tokens starting with `-` as the
-		// boundary unless they're one of the known global option prefixes that
-		// can sit before paths.
+		// find's expression starts at the first token beginning with `-`, `(`,
+		// `)`, `!`, or `,`. Global options like `-H -L -P -D <arg> -O <arg>`
+		// can sit before paths; treat them specially.
 		if (inPaths) {
 			if (bare === '-H' || bare === '-L' || bare === '-P') continue
 			if (bare === '-D' || bare === '-O') {
@@ -423,8 +533,6 @@ function analyzeFind(tokens: string[], headIdx: number): FindAnalysis {
 			continue
 		}
 		if (bare === '-exec' || bare === '-execdir') {
-			// Next token is the command. May be preceded by env vars but
-			// realistically inside -exec people just write the command.
 			const next = j + 1 < tokens.length ? stripQuotes(tokens[j + 1]!) : ''
 			if (RM_LIKE.has(next)) result.isDelete = true
 		}
@@ -439,37 +547,15 @@ function analyzeFind(tokens: string[], headIdx: number): FindAnalysis {
  * (e.g. no command given, or only flags).
  */
 function findXargsCommand(tokens: string[], headIdx: number): string | undefined {
-	// Flags that take an argument.
-	const argFlags = new Set([
-		'-I',
-		'-i',
-		'-L',
-		'-l',
-		'-n',
-		'-P',
-		'-s',
-		'-E',
-		'-d',
-		'-a',
-		'--replace',
-		'--max-lines',
-		'--max-args',
-		'--max-procs',
-		'--max-chars',
-		'--eof',
-		'--delimiter',
-		'--arg-file',
-	])
 	for (let j = headIdx + 1; j < tokens.length; j++) {
 		const bare = stripQuotes(tokens[j]!)
 		if (!bare.startsWith('-')) return bare
-		// Long flag with `=value` form — skip whole token.
-		if (bare.includes('=')) continue
-		if (argFlags.has(bare)) {
+		if (bare.includes('=')) continue // long flag with =value
+		if (XARGS_FLAGS_WITH_ARG.has(bare)) {
 			j++ // skip flag's argument
 			continue
 		}
-		// Boolean flags like -0, -t, -r, -p — just skip.
+		// Boolean flag (-0, -t, -r, -p, …) — just skip.
 	}
 	return undefined
 }
@@ -484,14 +570,9 @@ function findXargsCommand(tokens: string[], headIdx: number): string | undefined
  * All other parts of the command are preserved verbatim.
  */
 export function rewriteRmToTrash(cmd: string): string {
-	const segments = splitWithSeparators(cmd)
 	let out = ''
-	for (const piece of segments) {
-		if (piece.kind === 'sep') {
-			out += piece.text
-			continue
-		}
-		out += rewriteSegment(piece.text)
+	for (const piece of splitWithSeparators(cmd)) {
+		out += piece.kind === 'sep' ? piece.text : rewriteSegment(piece.text)
 	}
 	return out
 }
@@ -499,19 +580,18 @@ export function rewriteRmToTrash(cmd: string): string {
 function rewriteSegment(segment: string): string {
 	const tokens = tokenize(segment)
 	if (tokens.length === 0) return segment
-	let i = 0
-	while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(stripQuotes(tokens[i]!))) i++
-	const head = i < tokens.length ? stripQuotes(tokens[i]!) : ''
+	const headIdx = skipEnvAssignments(tokens)
+	const head = headIdx < tokens.length ? stripQuotes(tokens[headIdx]!) : ''
 
 	const leadingWs = segment.match(/^\s*/)?.[0] ?? ''
 	const trailingWs = segment.match(/\s*$/)?.[0] ?? ''
-	const envPrefix = tokens.slice(0, i).join(' ')
+	const envPrefix = tokens.slice(0, headIdx).join(' ')
 
 	if (RM_LIKE.has(head)) {
-		// Reconstruct: env prefix + "trash" + path tokens (quoted as-is).
+		// Reconstruct: env prefix + "trash" + path tokens (keep original quoting).
 		const paths: string[] = []
 		let sawDoubleDash = false
-		for (let j = i + 1; j < tokens.length; j++) {
+		for (let j = headIdx + 1; j < tokens.length; j++) {
 			const tok = tokens[j]!
 			const bare = stripQuotes(tok)
 			if (!sawDoubleDash) {
@@ -521,20 +601,20 @@ function rewriteSegment(segment: string): string {
 				}
 				if (bare.startsWith('-') && bare.length > 1) continue
 			}
-			paths.push(tok) // keep original quoting
+			paths.push(tok)
 		}
 		const parts = [envPrefix, 'trash', ...paths].filter((s) => s.length > 0)
 		return leadingWs + parts.join(' ') + trailingWs
 	}
 
 	if (head === 'find') {
-		const rewritten = rewriteFindTokens(tokens, i)
+		const rewritten = rewriteFindTokens(tokens, headIdx)
 		if (!rewritten) return segment
 		return leadingWs + rewritten.join(' ') + trailingWs
 	}
 
 	if (head === 'xargs') {
-		const rewritten = rewriteXargsTokens(tokens, i)
+		const rewritten = rewriteXargsTokens(tokens, headIdx)
 		if (!rewritten) return segment
 		return leadingWs + rewritten.join(' ') + trailingWs
 	}
@@ -560,8 +640,6 @@ function rewriteFindTokens(tokens: string[], headIdx: number): string[] | undefi
 			continue
 		}
 		if (bare === '-exec' || bare === '-execdir') {
-			// Look ahead for `rm/rmdir/unlink` and rewrite to `trash`,
-			// dropping that command's flags up to `{}`.
 			const next = j + 1 < tokens.length ? stripQuotes(tokens[j + 1]!) : ''
 			if (RM_LIKE.has(next)) {
 				out.push(tok, 'trash')
@@ -605,33 +683,17 @@ function rewriteFindTokens(tokens: string[], headIdx: number): string[] | undefi
  * isn't a deletion.
  */
 function rewriteXargsTokens(tokens: string[], headIdx: number): string[] | undefined {
-	const argFlags = new Set([
-		'-I',
-		'-i',
-		'-L',
-		'-l',
-		'-n',
-		'-P',
-		'-s',
-		'-E',
-		'-d',
-		'-a',
-		'--replace',
-		'--max-lines',
-		'--max-args',
-		'--max-procs',
-		'--max-chars',
-		'--eof',
-		'--delimiter',
-		'--arg-file',
-	])
 	const out = tokens.slice(0, headIdx + 1)
 	let j = headIdx + 1
 	while (j < tokens.length) {
 		const bare = stripQuotes(tokens[j]!)
 		if (!bare.startsWith('-')) break
 		out.push(tokens[j]!)
-		if (!bare.includes('=') && argFlags.has(bare) && j + 1 < tokens.length) {
+		if (
+			!bare.includes('=') &&
+			XARGS_FLAGS_WITH_ARG.has(bare) &&
+			j + 1 < tokens.length
+		) {
 			out.push(tokens[j + 1]!)
 			j += 2
 			continue
@@ -658,6 +720,13 @@ function rewriteXargsTokens(tokens: string[], headIdx: number): string[] | undef
 	}
 	return out
 }
+
+// ---------- low-level tokenization helpers ----------
+//
+// splitWithSeparators and tokenize intentionally implement the same minimal
+// quoting rules: `'` and `"` preserve internal whitespace; `\` escapes the
+// next char (only inside `"..."` or outside quotes). They are not full
+// POSIX-correct.
 
 interface Piece {
 	kind: 'cmd' | 'sep'
@@ -780,4 +849,15 @@ function stripQuotes(tok: string): string {
 		}
 	}
 	return tok
+}
+
+function isEnvAssignmentToken(tok: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9_]*=/.test(stripQuotes(tok))
+}
+
+/** Index of the command head, after any leading `FOO=bar BAR=baz` env assignments. */
+function skipEnvAssignments(tokens: string[]): number {
+	let i = 0
+	while (i < tokens.length && isEnvAssignmentToken(tokens[i]!)) i++
+	return i
 }
