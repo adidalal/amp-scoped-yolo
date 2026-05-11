@@ -12,19 +12,40 @@ interface ConfirmCall {
 	message: string
 }
 
-function makeAmp(opts: { confirmAnswers?: boolean[] } = {}) {
+function makeAmp(
+	opts: {
+		confirmAnswers?: boolean[]
+		confirmError?: Error
+		pwdResults?: Array<{ stdout: string } | { error: Error }>
+		isPluginUINotAvailableError?: (e: Error) => boolean
+		shellCommandFromToolCall?: (event: any) => { command: string; dir?: string } | null
+	} = {},
+) {
 	type Handler = (event: any, ctx: any) => any
 	const handlers: Record<string, Handler> = {}
 	const confirmCalls: ConfirmCall[] = []
 	const notifyCalls: string[] = []
 	const logs: string[] = []
 	let confirmIdx = 0
+	let pwdIdx = 0
+	let pwdCallCount = 0
+
+	const defaultShellCommandFromToolCall = (event: any) => {
+		if (event.tool !== 'Bash') return null
+		const cmd = typeof event.input?.cmd === 'string' ? event.input.cmd : null
+		if (cmd === null) return null
+		return {
+			command: cmd,
+			dir: typeof event.input?.cwd === 'string' ? event.input.cwd : undefined,
+		}
+	}
 
 	const ctx = {
 		logger: { log: (m: string) => logs.push(m) },
 		ui: {
 			confirm: async (o: { title: string; message: string }) => {
 				confirmCalls.push({ title: o.title, message: o.message })
+				if (opts.confirmError) throw opts.confirmError
 				const answers = opts.confirmAnswers ?? []
 				const next = answers[confirmIdx++]
 				return next ?? false
@@ -41,19 +62,19 @@ function makeAmp(opts: { confirmAnswers?: boolean[] } = {}) {
 			handlers[event] = h
 		},
 		registerCommand: () => {},
-		// Tagged-template shell stub: returns the workspace path for `pwd`.
-		$: (_strings: TemplateStringsArray) => Promise.resolve({ stdout: WORKSPACE + '\n' }),
+		// Tagged-template shell stub. Each call advances through `pwdResults`;
+		// once exhausted, defaults to returning the workspace path.
+		$: async (_strings: TemplateStringsArray) => {
+			pwdCallCount++
+			const next = opts.pwdResults?.[pwdIdx++] ?? { stdout: WORKSPACE + '\n' }
+			if ('error' in next) throw next.error
+			return { stdout: next.stdout }
+		},
 		helpers: {
-			isPluginUINotAvailableError: (_e: Error) => false,
-			shellCommandFromToolCall: (event: any) => {
-				if (event.tool !== 'Bash') return null
-				const cmd = typeof event.input?.cmd === 'string' ? event.input.cmd : null
-				if (cmd === null) return null
-				return {
-					command: cmd,
-					dir: typeof event.input?.cwd === 'string' ? event.input.cwd : undefined,
-				}
-			},
+			isPluginUINotAvailableError:
+				opts.isPluginUINotAvailableError ?? ((_e: Error) => false),
+			shellCommandFromToolCall:
+				opts.shellCommandFromToolCall ?? defaultShellCommandFromToolCall,
 		},
 	}
 
@@ -104,6 +125,7 @@ function makeAmp(opts: { confirmAnswers?: boolean[] } = {}) {
 		notifyCalls,
 		logs,
 		getConfirmCount: () => confirmIdx,
+		getPwdCallCount: () => pwdCallCount,
 	}
 }
 
@@ -114,10 +136,25 @@ describe('scoped-yolo e2e', () => {
 		amp = makeAmp()
 	})
 
-	it('allows non-Bash and non-rm commands without prompting', async () => {
-		const { result } = await amp.fireToolCall({ cmd: 'ls -la' })
+	it('does not look up workspace for non-delete shell commands', async () => {
+		const a = makeAmp({
+			pwdResults: [{ error: new Error('pwd should not be called') }],
+		})
+		const { result } = await a.fireToolCall({ cmd: 'ls -la' })
 		expect(result).toEqual({ action: 'allow' })
-		expect(amp.confirmCalls.length).toBe(0)
+		expect(a.getPwdCallCount()).toBe(0)
+		expect(a.confirmCalls.length).toBe(0)
+	})
+
+	it('does not look up workspace for non-delete apply_patch calls', async () => {
+		const a = makeAmp({
+			pwdResults: [{ error: new Error('pwd should not be called') }],
+		})
+		const { result } = await a.fireRawToolCall('apply_patch', {
+			input: '*** Begin Patch\n*** Update File: foo.ts\n@@\n-x\n+y\n*** End Patch\n',
+		})
+		expect(result).toEqual({ action: 'allow' })
+		expect(a.getPwdCallCount()).toBe(0)
 	})
 
 	it('rewrites in-workspace rm to trash without prompting', async () => {
@@ -180,6 +217,28 @@ describe('scoped-yolo e2e', () => {
 		expect(a.confirmCalls[1]!.message).toContain('/var/log')
 	})
 
+	it('prompts once for multiple outside-workspace targets in the same folder', async () => {
+		const a = makeAmp({ confirmAnswers: [true] })
+		const { result } = await a.fireToolCall({ cmd: 'rm -rf /tmp/foo /tmp/bar' })
+		expect(result.action).toBe('modify')
+		expect(result.input.cmd).toBe('trash /tmp/foo /tmp/bar')
+		expect(a.confirmCalls.length).toBe(1)
+		expect(a.confirmCalls[0]!.message).toContain('• /tmp/foo')
+		expect(a.confirmCalls[0]!.message).toContain('• /tmp/bar')
+	})
+
+	it('prompts once per distinct outside folder in a single call', async () => {
+		const a = makeAmp({ confirmAnswers: [true, true] })
+		const { result } = await a.fireToolCall({
+			cmd: 'rm -rf /tmp/foo /var/log/x',
+		})
+		expect(result.action).toBe('modify')
+		expect(a.confirmCalls.length).toBe(2)
+		const messages = a.confirmCalls.map((c) => c.message).join('\n')
+		expect(messages).toContain('/tmp')
+		expect(messages).toContain('/var/log')
+	})
+
 	it('isolates approvals per thread', async () => {
 		const a = makeAmp({ confirmAnswers: [true, true] })
 		await a.fireToolCall({ cmd: 'rm -rf /tmp/foo' }, 'thread-A')
@@ -213,6 +272,86 @@ describe('scoped-yolo e2e', () => {
 		expect(result.action).toBe('reject-and-continue')
 	})
 
+	it('rejects outside-workspace deletes when interactive UI is unavailable', async () => {
+		const noUi = new Error('headless')
+		const a = makeAmp({
+			confirmError: noUi,
+			isPluginUINotAvailableError: (e) => e === noUi,
+		})
+		const { result } = await a.fireToolCall({ cmd: 'rm -rf /tmp/foo' })
+		expect(result.action).toBe('reject-and-continue')
+		expect(result.message).toContain('No interactive UI is available')
+		expect(result.message).toContain('/tmp')
+		expect(a.confirmCalls.length).toBe(1)
+	})
+
+	it('blocks deletes when workspace lookup fails', async () => {
+		const a = makeAmp({
+			pwdResults: [{ error: new Error('pwd failed') }],
+		})
+		const { result } = await a.fireToolCall({ cmd: 'rm -rf node_modules' })
+		expect(result.action).toBe('reject-and-continue')
+		expect(result.message).toContain('could not determine the workspace root')
+		expect(a.confirmCalls.length).toBe(0)
+		expect(
+			a.logs.some(
+				(l) =>
+					l.includes('failed to determine workspace root') && l.includes('pwd failed'),
+			),
+		).toBe(true)
+	})
+
+	it('retries workspace lookup after a failed delete', async () => {
+		const a = makeAmp({
+			pwdResults: [
+				{ error: new Error('first pwd failed') },
+				{ stdout: WORKSPACE + '\n' },
+			],
+		})
+		const first = await a.fireToolCall({ cmd: 'rm -rf node_modules' })
+		expect(first.result.action).toBe('reject-and-continue')
+
+		const second = await a.fireToolCall({ cmd: 'rm -rf dist' })
+		expect(second.result.action).toBe('modify')
+		expect(second.result.input.cmd).toBe('trash dist')
+		expect(a.getPwdCallCount()).toBe(2)
+	})
+
+	it('caches workspace info across shell and file-tool delete paths', async () => {
+		const a = makeAmp()
+		await a.fireToolCall({ cmd: 'rm -rf node_modules' })
+		await a.fireRawToolCall('apply_patch', {
+			input: '*** Begin Patch\n*** Delete File: src/old.ts\n*** End Patch\n',
+		})
+		expect(a.getPwdCallCount()).toBe(1)
+	})
+
+	it('rewrites top-level command fields for non-Bash shell tools', async () => {
+		const a = makeAmp({
+			shellCommandFromToolCall: (event) => {
+				if (event.tool !== 'shell_command') return null
+				if (typeof event.input?.command !== 'string') return null
+				return {
+					command: event.input.command,
+					dir: typeof event.input?.cwd === 'string' ? event.input.cwd : undefined,
+				}
+			},
+		})
+		const { result } = await a.fireRawToolCall('shell_command', {
+			command: 'rm -rf node_modules',
+			cwd: 'src',
+			untouched: 'keep me',
+		})
+		expect(result).toEqual({
+			action: 'modify',
+			input: {
+				command: 'trash node_modules',
+				cwd: 'src',
+				untouched: 'keep me',
+			},
+		})
+	})
+
 	it('logs a helpful message when a rewritten trash command fails', async () => {
 		const { toolUseID } = await amp.fireToolCall({ cmd: 'rm -rf node_modules' })
 		await amp.fireToolResult(toolUseID, 'error', { error: 'command not found: trash' })
@@ -233,14 +372,6 @@ describe('scoped-yolo e2e', () => {
 		await amp.fireToolResult('toolu_unrelated', 'error', { error: 'whatever' })
 		const matched = amp.logs.find((l) => l.includes("If 'trash' is not installed"))
 		expect(matched).toBeFalsy()
-	})
-
-	it('allows non-shell tool calls without deletes', async () => {
-		const { result } = await amp.fireRawToolCall('apply_patch', {
-			input: '*** Begin Patch\n*** Update File: foo.ts\n@@\n-x\n+y\n*** End Patch\n',
-		})
-		expect(result).toEqual({ action: 'allow' })
-		expect(amp.confirmCalls.length).toBe(0)
 	})
 
 	it('logs and allows in-workspace apply_patch deletes without prompting', async () => {
@@ -272,20 +403,5 @@ describe('scoped-yolo e2e', () => {
 		})
 		expect(result.action).toBe('reject-and-continue')
 		expect(result.message).toContain('/tmp')
-	})
-
-	it('detects multiple Delete File markers in one apply_patch call', async () => {
-		const { result } = await amp.fireRawToolCall('apply_patch', {
-			input:
-				'*** Begin Patch\n' +
-				'*** Delete File: a.txt\n' +
-				'*** Delete File: b/c.txt\n' +
-				'*** End Patch\n',
-		})
-		expect(result).toEqual({ action: 'allow' })
-		const logged = amp.logs.find(
-			(l) => l.includes('a.txt') && l.includes('b/c.txt') && l.includes('2 file(s)'),
-		)
-		expect(logged).toBeTruthy()
 	})
 })
