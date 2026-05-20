@@ -6,7 +6,7 @@
  *    targets a path outside the workspace.
  */
 
-import type { PluginAPI, ToolCallResult } from '@ampcode/plugin'
+import type { PluginAPI, ShellFunction, ToolCallResult } from '@ampcode/plugin'
 import { lstat, realpath } from 'node:fs/promises'
 import * as path from 'node:path'
 
@@ -29,6 +29,12 @@ interface ToolCallContext {
 		confirm(options: ConfirmOptions): Promise<boolean>
 		notify(message: string): Promise<void>
 	}
+	/**
+	 * Per-event shell. Unlike `amp.$` (which runs in the plugin host's cwd,
+	 * typically `~/.config/amp/plugins`), `ctx.$` runs in the user's
+	 * workspace — so `pwd` here returns the workspace root.
+	 */
+	$: ShellFunction
 }
 
 const RM_LIKE = new Set(['rm', 'rmdir', 'unlink'])
@@ -78,11 +84,15 @@ export default function scopedYolo(amp: PluginAPI) {
 	// instance — we assume one plugin instance per workspace/session. Resolved
 	// lazily, only when a delete is detected, so a `pwd` failure can't affect
 	// unrelated tool calls.
+	//
+	// We must use the per-event `ctx.$` shell (not `amp.$`) because `amp.$`
+	// runs in the plugin host's cwd (~/.config/amp/plugins) while `ctx.$`
+	// runs in the user's workspace.
 	let workspaceInfoPromise: Promise<WorkspaceInfo> | null = null
-	const getWorkspaceInfo = (): Promise<WorkspaceInfo> => {
+	const getWorkspaceInfo = (ctx: ToolCallContext): Promise<WorkspaceInfo> => {
 		if (!workspaceInfoPromise) {
 			workspaceInfoPromise = (async () => {
-				const result = await amp.$`pwd`
+				const result = await ctx.$`pwd`
 				const root = result.stdout.toString().trim()
 				const canonicalRoot = await canonicalize(root)
 				return { root, canonicalRoot }
@@ -178,7 +188,7 @@ export default function scopedYolo(amp: PluginAPI) {
 		ctx: ToolCallContext,
 	): Promise<WorkspaceInfo | undefined> {
 		try {
-			return await getWorkspaceInfo()
+			return await getWorkspaceInfo(ctx)
 		} catch (err) {
 			ctx.logger.log(
 				`scoped-yolo: failed to determine workspace root, blocking delete. ` +

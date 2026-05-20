@@ -1,6 +1,6 @@
 {
   "name": "scoped-yolo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Scoped-yolo: minimal permissions plugin for Amp. Ask before deleting outside the workspace, and use `trash` instead of `rm`.",
   "type": "module",
   "main": "src/index.ts",
@@ -11,6 +11,6 @@
   "devDependencies": {
     "@ampcode/plugin": "latest",
     "@types/bun": "*",
-    "typescript": "^5"
+    "typescript": "^6"
   }
 }

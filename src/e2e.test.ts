@@ -40,6 +40,16 @@ function makeAmp(
 		}
 	}
 
+	// Per-event shell. The plugin uses `ctx.$` (not `amp.$`) for `pwd` because
+	// `amp.$` runs in the plugin host's cwd, while `ctx.$` runs in the user's
+	// workspace.
+	const ctxShell = async (_strings: TemplateStringsArray) => {
+		pwdCallCount++
+		const next = opts.pwdResults?.[pwdIdx++] ?? { stdout: WORKSPACE + '\n' }
+		if ('error' in next) throw next.error
+		return { stdout: next.stdout }
+	}
+
 	const ctx = {
 		logger: { log: (m: string) => logs.push(m) },
 		ui: {
@@ -54,6 +64,7 @@ function makeAmp(
 				notifyCalls.push(m)
 			},
 		},
+		$: ctxShell,
 	}
 
 	const amp: any = {
@@ -62,13 +73,11 @@ function makeAmp(
 			handlers[event] = h
 		},
 		registerCommand: () => {},
-		// Tagged-template shell stub. Each call advances through `pwdResults`;
-		// once exhausted, defaults to returning the workspace path.
+		// `amp.$` exists on the PluginAPI but the plugin must not use it for
+		// workspace discovery (its cwd is the plugin dir, not the workspace).
+		// Always throws here to enforce that.
 		$: async (_strings: TemplateStringsArray) => {
-			pwdCallCount++
-			const next = opts.pwdResults?.[pwdIdx++] ?? { stdout: WORKSPACE + '\n' }
-			if ('error' in next) throw next.error
-			return { stdout: next.stdout }
+			throw new Error('amp.$ must not be used for workspace discovery; use ctx.$')
 		},
 		helpers: {
 			isPluginUINotAvailableError:

@@ -9,6 +9,10 @@ run = "bun test"
 description = "Type-check the plugin"
 run = "bun run typecheck"
 
+[tasks.upgrade]
+description = "Upgrade all packages and the bun lockfile"
+run = "bun update --latest"
+
 [tasks.install]
 description = "Symlink the plugin into ~/.config/amp/plugins/scoped-yolo.ts"
 run = '''
